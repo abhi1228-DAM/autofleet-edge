@@ -1,6 +1,7 @@
 # AutoFleet-Edge
 ## Demo
 
+https://github.com/user-attachments/assets/27201d6c-e82b-4532-8220-4e403787ac76
 A ROS 2 learning project that drives a simulated differential-drive vehicle to an `(x, y)` target using position feedback.
 
 The current demo uses **ROS 2 Humble**, **Gazebo Fortress**, and **Python**, running in Docker on an **Apple silicon Mac**. It controls the blue vehicle in the upstream `ros_gz_sim_demos` world.
