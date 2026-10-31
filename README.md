@@ -1,4 +1,5 @@
 # AutoFleet-Edge
+
 ## Demo
 
 https://github.com/user-attachments/assets/27201d6c-e82b-4532-8220-4e403787ac76
@@ -9,11 +10,12 @@ The current demo uses **ROS 2 Humble**, **Gazebo Fortress**, and **Python**, run
 
 ## What works
 
+- Choose `loading_bay` or `drop_off` by name, or supply explicit coordinates.
 - Read the vehicle's position and orientation from odometry.
 - Turn toward a target, move forward, and slow down near the destination.
 - Send stop commands when the vehicle is within **0.10 m** of the target.
 - Send stop commands on stale feedback, bridge loss, timeout, or Ctrl+C.
-- Run nine offline tests for the control calculations and stopping decisions.
+- Run 16 offline tests for target selection, control calculations, and stopping decisions.
 
 This is a single-vehicle coordinate-control exercise. Mapping, obstacle avoidance, natural-language instructions, and fleet coordination are future work.
 
@@ -44,6 +46,27 @@ Target coordinates use the incoming odometry frame, observed as `vehicle_blue/od
 | `.devcontainer/` | Earlier development-container scaffold. The Mac workflow below uses a desktop image directly. |
 
 The coordinate controller accepts targets through command-line arguments. It does not subscribe to `/goal_pose`; the earlier publisher uses a different frame (`map`) and has not been integrated with it.
+
+## Named destinations
+
+| Name | x (m) | y (m) |
+| --- | --- | --- |
+| `loading_bay` | 0.0 | 1.0 |
+| `drop_off` | 1.5 | 1.0 |
+
+These names are labels for coordinates in the vehicle's odometry frame. They do not add buildings to the world, create a map, or provide natural-language understanding. The pairs are stored in the `DESTINATIONS` dictionary near the top of `autofleet_go_to.py`.
+
+List them from the repository directory without starting ROS or moving the vehicle:
+
+```bash
+python3 autofleet_go_to.py --list-destinations
+```
+
+Choose a name with `--destination`, or supply both `--x` and `--y`. Unknown names, incomplete coordinate pairs, and mixing the two target formats are rejected before ROS starts. The existing coordinate command remains available:
+
+```bash
+python3 /home/ubuntu/autofleet_go_to.py --x 0.0 --y 1.0
+```
 
 ## Run on an Apple silicon Mac
 
@@ -120,17 +143,17 @@ In this second Ubuntu shell:
 
 ```bash
 source /opt/ros/humble/setup.bash
-python3 /home/ubuntu/autofleet_go_to.py --x 0.0 --y 1.0
+python3 /home/ubuntu/autofleet_go_to.py --destination loading_bay
 ```
 
 Stop any earlier manual velocity publisher before running the controller. Use one blue-vehicle controller at a time.
 
-The program prints `WAITING`, then `TARGET`, motion updates when needed, and finally `ARRIVED` or `STOPPED`. Watch the vehicle as well as the terminal. Ctrl+C requests cancellation and sends repeated zero-velocity commands.
+For a named target, the program first prints `DESTINATION` with its coordinates. It then prints `WAITING`, `TARGET`, motion updates when needed, and finally `ARRIVED` or `STOPPED`. Watch the vehicle as well as the terminal. Ctrl+C requests cancellation and sends repeated zero-velocity commands.
 
 After the first run finishes, try another target in the open area:
 
 ```bash
-python3 /home/ubuntu/autofleet_go_to.py --x 1.5 --y 1.0
+python3 /home/ubuntu/autofleet_go_to.py --destination drop_off
 ```
 
 ### 5. Check position feedback
@@ -141,16 +164,30 @@ In a sourced Ubuntu shell:
 ros2 topic echo /model/vehicle_blue/odometry --once --field pose.pose.position
 ```
 
-## Observed result
+## Observed simulation results
 
-One manually run simulation test produced:
+On 2026-10-30, two named-destination commands run manually in the simulation reported `ARRIVED`. Both used the incoming `vehicle_blue/odom` frame.
+
+| Destination | Target x, y (m) | Reported arrival x, y (m) | Reported target error |
+| --- | --- | --- | --- |
+| `loading_bay` | 0.000, 1.000 | -0.001, 0.965 | 0.035 m (3.5 cm) |
+| `drop_off` | 1.500, 1.000 | 1.434, 0.997 | 0.066 m (6.6 cm) |
+
+Terminal excerpts from those runs:
 
 ```text
+DESTINATION loading_bay -> x=0.00, y=1.00 m
 TARGET x=0.00, y=1.00 m in frame 'vehicle_blue/odom'
-ARRIVED: x=-0.001, y=0.963; target error=0.037 m. Stopping.
+ARRIVED: x=-0.001, y=0.965; target error=0.035 m. Stopping.
+
+DESTINATION drop_off -> x=1.50, y=1.00 m
+TARGET x=1.50, y=1.00 m in frame 'vehicle_blue/odom'
+ARRIVED: x=1.434, y=0.997; target error=0.066 m. Stopping.
 ```
 
-The reported odometry error was **3.7 cm**, within the configured 10 cm tolerance. This is one observed result, not a repeatability or accuracy benchmark.
+Both reported errors were within the configured **10 cm arrival tolerance**. During the `drop_off` run, the controller first commanded a turn with zero forward speed, then forward motion, and reduced forward speed near the target.
+
+These are individual observations based on the controller's odometry feedback. They do not establish repeatability or accuracy against an independent ground-truth measurement. An earlier coordinate-command run (`--x 0.0 --y 1.0`) reported a 0.037 m (3.7 cm) target error.
 
 ## Offline tests
 
@@ -160,14 +197,17 @@ From the repository directory, using Python 3.8 or later:
 python3 autofleet_go_to.py --self-test
 ```
 
-Nine tests passed during development. They cover turning direction, angle wrapping, arrival, speed limits, quaternion handling, stopping decisions, and convergence in a simple motion model. ROS and Gazebo are not required for these tests; they do not test live message transport or obstacle handling.
+All 16 tests passed during development. They cover turning direction, angle wrapping, arrival, speed limits, quaternion handling, stopping decisions, and convergence in a simple motion model. They also check that named targets reach the controller with the correct coordinates, coordinate commands still work, invalid arguments are rejected before ROS starts, and listing destinations does not start ROS. ROS and Gazebo are not required for these tests; they do not test live message transport or obstacle handling.
 
 ## Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
+| `container ... is not running` | Run `docker start autofleet-desktop` in the Mac Terminal, then relaunch Gazebo before requesting movement. |
 | `file 'diff' was not found` | Use `diff_drive.launch.py` with no space inside the filename. |
 | `No such file or directory` for the controller | Repeat `docker cp` from the Mac directory containing `autofleet_go_to.py`. |
+| `unrecognized arguments` for `--destination` or `--list-destinations` | Copy the updated script into the container; check the actual downloaded filename, which may have a suffix such as `-2`. Keep the container filename `/home/ubuntu/autofleet_go_to.py`. |
+| `invalid choice` for a destination | Use `--list-destinations` and copy a name exactly, including its underscore. |
 | No fresh odometry or velocity subscriber | Keep the demo launch process running and Gazebo unpaused. |
 | `STALE_ODOMETRY` | Check whether Gazebo is paused, stalled, or running too slowly; resume it before rerunning. |
 | Simulation time reset | Restart the controller after resetting the simulation. |
@@ -180,7 +220,7 @@ Nine tests passed during development. They cover turning direction, angle wrappi
 - Stop commands require a running process and working transport; forcibly terminating the process or container prevents cleanup.
 - Physical robots, natural-language task parsing, and multiple-robot operation have not been validated.
 
-Planned improvements are a recorded demo, repeated arrival measurements, named destinations, and integration with a navigation stack that can plan around obstacles.
+Planned improvements are repeated arrival measurements, sequences of named destinations, and integration with a navigation stack that can plan around obstacles.
 
 ## Credits
 
