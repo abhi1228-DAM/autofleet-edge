@@ -8,6 +8,13 @@ cmd_vel publisher first. Coordinates are in the incoming odometry frame.
 
 Run inside your ROS 2 Humble container, with Gazebo running and unpaused:
     source /opt/ros/humble/setup.bash
+    python3 autofleet_go_to.py --destination loading_bay
+    python3 autofleet_go_to.py --destination drop_off
+
+List the destination names without starting ROS or moving the vehicle:
+    python3 autofleet_go_to.py --list-destinations
+
+Explicit odometry coordinates are also supported:
     python3 autofleet_go_to.py --x 0.0 --y 1.0
 
 Run the offline tests with any Python 3.8+ installation (ROS is not required):
@@ -32,6 +39,12 @@ MAX_FORWARD = 0.15    # metres/second
 MAX_TURN = 0.60       # radians/second
 STALE_AFTER = 2.0     # wall-clock seconds without an advancing odometry timestamp
 STARTUP_TIMEOUT = 20.0
+
+# Labels for coordinates in the vehicle's odometry frame, not mapped places.
+DESTINATIONS = {
+    "loading_bay": (0.0, 1.0),
+    "drop_off": (1.5, 1.0),
+}
 
 
 def wrap_angle(angle):
@@ -87,8 +100,11 @@ def decide(pose, goal, *, feedback_age, elapsed, timeout, bridge_ready=True):
 
 
 def self_test():
-    """Check motion, failure stops, and convergence with a simple kinematic model."""
+    """Check target selection, stopping, and a simple kinematic motion model."""
+    import io
     import unittest
+    from contextlib import redirect_stderr, redirect_stdout
+    from unittest import mock
 
     class ControllerTests(unittest.TestCase):
         def command(self, pose=(0.0, 0.0, 0.0), goal=(1.0, 0.0), **kw):
@@ -161,7 +177,85 @@ def self_test():
                     self.assertEqual(c.status, "ARRIVED")
                     self.assertLessEqual(c.distance, TOLERANCE)
 
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(ControllerTests)
+    class DestinationTests(unittest.TestCase):
+        def test_named_destinations_dispatch_the_expected_targets(self):
+            for name, target in [("loading_bay", (0.0, 1.0)), ("drop_off", (1.5, 1.0))]:
+                with self.subTest(name=name):
+                    output = io.StringIO()
+                    with mock.patch(__name__ + ".run_ros", return_value=0) as run:
+                        with redirect_stdout(output):
+                            result = main(["--destination", name, "--timeout", "45"])
+                    self.assertEqual(result, 0)
+                    run.assert_called_once_with(target, 45.0)
+                    self.assertIn("DESTINATION " + name, output.getvalue())
+
+        def test_explicit_coordinates_still_dispatch(self):
+            with mock.patch(__name__ + ".run_ros", return_value=0) as run:
+                result = main(["--x", "-0.5", "--y", "2.0"])
+            self.assertEqual(result, 0)
+            run.assert_called_once_with((-0.5, 2.0), 90.0)
+
+        def assert_rejected_without_ros(self, argv):
+            errors = io.StringIO()
+            with mock.patch(__name__ + ".run_ros") as run:
+                with redirect_stderr(errors), self.assertRaises(SystemExit) as exc:
+                    main(argv)
+            self.assertEqual(exc.exception.code, 2)
+            run.assert_not_called()
+            return errors.getvalue()
+
+        def test_unknown_destination_is_rejected_before_ros(self):
+            errors = self.assert_rejected_without_ros(["--destination", "unknown_place"])
+            self.assertIn("loading_bay", errors)
+            self.assertIn("drop_off", errors)
+
+        def test_mixed_and_incomplete_targets_are_rejected(self):
+            for argv in [
+                [], ["--x", "0"], ["--y", "1"],
+                ["--destination", "loading_bay", "--x", "0"],
+                ["--destination", "loading_bay", "--y", "1"],
+                ["--destination", "drop_off", "--x", "0", "--y", "1"],
+            ]:
+                with self.subTest(argv=argv):
+                    self.assert_rejected_without_ros(argv)
+
+        def test_offline_actions_cannot_be_mixed_with_a_target(self):
+            for argv in [
+                ["--list-destinations", "--destination", "loading_bay"],
+                ["--list-destinations", "--x", "0", "--y", "1"],
+                ["--self-test", "--destination", "drop_off"],
+                ["--self-test", "--x", "0"],
+                ["--self-test", "--list-destinations"],
+            ]:
+                with self.subTest(argv=argv):
+                    self.assert_rejected_without_ros(argv)
+
+        def test_invalid_motion_numbers_are_rejected_before_ros(self):
+            for argv in [
+                ["--x", "nan", "--y", "1"],
+                ["--x", "0", "--y", "inf"],
+                ["--x", "0", "--y", "1", "--timeout", "-1"],
+                ["--destination", "loading_bay", "--timeout", "0"],
+                ["--destination", "drop_off", "--timeout", "nan"],
+                ["--destination", "drop_off", "--timeout", "inf"],
+            ]:
+                with self.subTest(argv=argv):
+                    self.assert_rejected_without_ros(argv)
+
+        def test_listing_destinations_does_not_start_ros(self):
+            output = io.StringIO()
+            with mock.patch(__name__ + ".run_ros") as run:
+                with redirect_stdout(output):
+                    result = main(["--list-destinations"])
+            self.assertEqual(result, 0)
+            run.assert_not_called()
+            self.assertIn("loading_bay: x=0.00, y=1.00", output.getvalue())
+            self.assertIn("drop_off: x=1.50, y=1.00", output.getvalue())
+
+    suite = unittest.TestSuite([
+        unittest.defaultTestLoader.loadTestsFromTestCase(ControllerTests),
+        unittest.defaultTestLoader.loadTestsFromTestCase(DestinationTests),
+    ])
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
 
@@ -301,19 +395,48 @@ def run_ros(goal, timeout):
     return outcome
 
 
-def main(argv=None):
+def parse_args(argv=None):
+    """Resolve exactly one target or offline action before ROS can start."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--destination", choices=DESTINATIONS,
+                         help="Drive to a named coordinate in the vehicle's odometry frame")
+    actions.add_argument("--list-destinations", action="store_true",
+                         help="List destination names and coordinates; no ROS or movement")
+    actions.add_argument("--self-test", action="store_true",
+                         help="Run offline controller tests; no ROS or movement")
     parser.add_argument("--x", type=float, help="Target x in the incoming odometry frame, metres")
     parser.add_argument("--y", type=float, help="Target y in the incoming odometry frame, metres")
     parser.add_argument("--timeout", type=float, default=90.0, help="Maximum motion time in wall seconds (default: 90)")
-    parser.add_argument("--self-test", action="store_true", help="Run offline controller tests; no ROS or movement")
     args = parser.parse_args(argv)
-    if args.self_test:
-        return self_test()
-    if args.x is None or args.y is None:
-        parser.error("Supply both --x and --y, or use --self-test.")
+    has_coordinates = args.x is not None or args.y is not None
+    if args.self_test or args.list_destinations:
+        if has_coordinates:
+            parser.error("Do not combine coordinates with --self-test or --list-destinations.")
+        return args
+    if args.destination is not None:
+        if has_coordinates:
+            parser.error("Choose --destination OR both --x and --y, not both target formats.")
+        args.x, args.y = DESTINATIONS[args.destination]
+    elif args.x is None or args.y is None:
+        parser.error("Supply --destination NAME or both --x and --y. Use --list-destinations to see names.")
     if not all(math.isfinite(v) for v in (args.x, args.y, args.timeout)) or args.timeout <= 0:
         parser.error("Coordinates must be finite numbers and timeout must be positive.")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.self_test:
+        return self_test()
+    if args.list_destinations:
+        print("Named destinations (metres in the vehicle's odometry frame):")
+        for name, (x, y) in DESTINATIONS.items():
+            print("  {}: x={:.2f}, y={:.2f}".format(name, x, y))
+        return 0
+    if args.destination is not None:
+        print("DESTINATION {} -> x={:.2f}, y={:.2f} m".format(
+            args.destination, args.x, args.y), flush=True)
     return run_ros((args.x, args.y), args.timeout)
 
 
